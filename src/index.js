@@ -1,0 +1,1537 @@
+import Resolver from '@forge/resolver';
+import api, { route, fetch } from '@forge/api';
+import { kvs, WhereConditions } from '@forge/kvs';
+import { scheduleState } from './monthly-schedule.mjs';
+
+const resolver = new Resolver();
+const CONTACT_INDEX = 'system-alert:contacts:index';
+const SETTINGS_KEY = 'system-alert:settings';
+const AUTO_TEST_PREFIX = 'system-alert:auto-test:';
+const SCHEDULER_STATUS_KEY = 'system-alert:monthly-scheduler-status';
+const DISPLAY_PROPERTY_KEY = 'system-alert-display';
+const PROVIDER_SETTINGS_KEY = 'system-alert:providers';
+const TEMPLATE_SETTINGS_KEY = 'system-alert:templates';
+const BRANDING_SETTINGS_KEY = 'system-alert:branding';
+const MICROSOFT_CONNECTION_KEY = 'system-alert:microsoft:connection';
+const MAX_LOGO_DATA_LENGTH = 200000;
+const HISTORY_SCRUB_KEY = 'system-alert:history-account-scrub';
+const HISTORY_PREFIXES = ['system-alert:history:', 'system-alert:test-history:'];
+const CONTACT_READ_CONCURRENCY = 10;
+const PROVIDER_SECRET_KEYS = {
+  sendgridApiKey: 'system-alert:provider:sendgrid-api-key',
+  twilioAccountSid: 'system-alert:provider:twilio-account-sid',
+  twilioAuthToken: 'system-alert:provider:twilio-auth-token',
+  twilioApiKey: 'system-alert:provider:twilio-api-key',
+  twilioApiSecret: 'system-alert:provider:twilio-api-secret',
+  microsoftClientSecret: 'system-alert:provider:microsoft-client-secret'
+};
+const APP_VERSION = '3.10.3';
+
+const DEFAULT_SETTINGS = {
+  clientFieldId: '',
+  issueStartFieldId: '',
+  nextUpdateFieldId: '',
+  allowedProjectKey: 'SD',
+  priorityConfigs: [
+    { name: 'P1', label: 'P1', color: '#AE2E24' },
+    { name: 'P2', label: 'P2', color: '#B65C02' }
+  ],
+  fromName: 'Service Desk',
+  replyToEmail: '',
+  monthlyTestEnabled: true,
+  monthlyTestHour: 10,
+  emailEnabled: true,
+  smsEnabled: true,
+  twilioRegion: 'global',
+  optionalFieldMappings: []
+};
+
+const DEFAULT_PROVIDER_SETTINGS = {
+  emailProvider: 'sendgrid',
+  microsoftMode: 'marketplace',
+  sendgridFromEmail: '',
+  sendgridFromName: 'Service Desk',
+  sendgridReplyToEmail: '',
+  microsoftTenantId: '',
+  microsoftClientId: '',
+  microsoftSenderMailbox: '',
+  microsoftFromName: 'Service Desk',
+  microsoftReplyToEmail: '',
+  microsoftClientSecretExpiry: '',
+  smsProvider: 'twilio',
+  twilioRegion: 'global',
+  twilioFromNumber: '',
+  twilioMessagingServiceSid: ''
+};
+
+const DEFAULT_BRANDING = {
+  serviceName: 'Service Desk',
+  logoUrl: '',
+  logoDataUri: '',
+  logoFileName: '',
+  headerBackground: '#172B4D',
+  headerText: '#FFFFFF',
+  accentColor: '#0C66E4',
+  pageBackground: '#F1F2F4',
+  footerBackground: '#F7F8F9',
+  footerText: 'Please reference {{issueKey}} in any correspondence regarding this incident.',
+  supportLabel: '',
+  supportUrl: ''
+};
+
+const DEFAULT_TEMPLATES = {
+  initial: {
+    subject: '{{priority}} SYSTEM ALERT | {{clientCode}} | {{issueKey}} | {{summary}}',
+    intro: 'A {{priority}} issue has been identified and our priority escalation process has been initiated.',
+    followup: 'Our support team is actively managing this incident. A further update will be provided by the time shown above, or sooner if there is a significant change.',
+    sms: 'Hi,\n\nA {{priority}} issue has been identified.\n\nIssue Start Time: {{startTime}}\n\nIssue: {{message}}\n\nNext Update Due: {{nextUpdate}}\n\nOur priority escalation process has started and a further update will follow shortly.\n\nMany Thanks'
+  },
+  update: {
+    subject: '{{priority}} UPDATE | {{clientCode}} | {{issueKey}} | {{summary}}',
+    intro: 'An update is available for this {{priority}} incident.',
+    followup: 'Our support team is actively managing this incident. A further update will be provided by the time shown above, or sooner if there is a significant change.',
+    sms: 'Hi,\n\nAn update is available for the {{priority}} issue.\n\nIssue Start Time: {{startTime}}\n\nIssue: {{message}}\n\nNext Update Due: {{nextUpdate}}\n\nOur priority escalation process remains active and a further update will follow shortly.\n\nMany Thanks'
+  },
+  resolved: {
+    subject: 'SERVICE RESTORED | {{clientCode}} | {{issueKey}} | {{summary}}',
+    intro: 'The {{priority}} incident has been resolved and service has been restored.',
+    followup: 'No further incident updates are planned at this time. The Service Desk will continue to monitor the service.',
+    sms: 'Hi,\n\nThe {{priority}} issue has now been resolved.\n\nIssue Start Time: {{startTime}}\n\nIssue: {{message}}\n\nService Status: Restored\n\nNo further updates are planned at this time.\n\nMany Thanks'
+  },
+  'monthly-test': {
+    subject: 'TEST ONLY | MONTHLY SYSTEM ALERT TEST | {{clientCode}} | {{testMonth}}',
+    intro: 'This is a scheduled test of the Service Desk System Alert service. There is no live service incident.',
+    followup: 'No action is required unless acknowledgement is part of the agreed test process.',
+    sms: 'Hi,\n\nThis is the scheduled monthly System Alert test for {{clientCode}}.\n\nThere is no live service incident.\n\nTest Month: {{testMonth}}\n{{referenceLine}}\nNo action is required unless acknowledgement is part of the agreed test process.\n\nMany Thanks'
+  }
+};
+
+const safeId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+const esc = (s='') => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const maskPhone = (p='') => p ? `${p.slice(0,4)}••••${p.slice(-3)}` : '';
+const monthKey = (date = new Date()) => `${date.getUTCFullYear()}-${String(date.getUTCMonth()+1).padStart(2,'0')}`;
+const monthLabel = (date = new Date()) => date.toLocaleString('en-IE', { month: 'long', year: 'numeric', timeZone: 'Europe/Dublin' });
+const formatDateTime = (value='') => {
+  if (!value) return '';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  return new Intl.DateTimeFormat('en-IE', {
+    day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
+    hour12: false, timeZone: 'Europe/Dublin'
+  }).format(d).replace(',', '');
+};
+
+const adfToText = (node) => {
+  if (!node) return '';
+  if (typeof node === 'string') return node;
+  if (Array.isArray(node)) return node.map(adfToText).join('');
+  if (node.type === 'hardBreak') return '\n';
+  const own = node.text || '';
+  const children = (node.content || []).map(adfToText).join('');
+  const block = ['paragraph','heading','bulletList','orderedList','listItem'].includes(node.type);
+  return own + children + (block ? '\n' : '');
+};
+
+const fieldText = (v) => {
+  if (v == null) return '';
+  if (typeof v === 'string' || typeof v === 'number') return String(v);
+  if (Array.isArray(v)) return v.map(fieldText).filter(Boolean).join(', ');
+  return v.value || v.name || v.displayName || v.key || v.label || '';
+};
+
+async function getSettings() {
+  const settings = { ...DEFAULT_SETTINGS, ...((await kvs.get(SETTINGS_KEY)) || {}) };
+  settings.priorityConfigs = normalizePriorityConfigs(settings.priorityConfigs);
+  settings.optionalFieldMappings = normalizeOptionalFieldMappings(settings.optionalFieldMappings);
+  return settings;
+}
+
+async function getProviderSettings() {
+  return { ...DEFAULT_PROVIDER_SETTINGS, ...((await kvs.get(PROVIDER_SETTINGS_KEY)) || {}) };
+}
+
+async function getProviderSecret(name) {
+  const key = PROVIDER_SECRET_KEYS[name];
+  return key ? (await kvs.getSecret(key)) || '' : '';
+}
+
+async function getTemplates() {
+  const stored = (await kvs.get(TEMPLATE_SETTINGS_KEY)) || {};
+  const out = {};
+  for (const [key, defaults] of Object.entries(DEFAULT_TEMPLATES)) out[key] = { ...defaults, ...(stored[key] || {}) };
+  return out;
+}
+
+async function getBranding() {
+  return { ...DEFAULT_BRANDING, ...((await kvs.get(BRANDING_SETTINGS_KEY)) || {}) };
+}
+
+
+async function getMicrosoftConnectionState() {
+  return (await kvs.get(MICROSOFT_CONNECTION_KEY)) || { status: 'disconnected' };
+}
+
+async function saveMicrosoftConnectionState(value = {}) {
+  const next = {
+    status: value.status === 'connected' ? 'connected' : 'disconnected',
+    mode: value.mode === 'enterprise' ? 'enterprise' : 'marketplace',
+    tenantId: normalizeTextValue(value.tenantId),
+    clientId: normalizeTextValue(value.clientId),
+    senderMailbox: normalizeTextValue(value.senderMailbox),
+    verifiedAt: normalizeTextValue(value.verifiedAt),
+    testSentAt: normalizeTextValue(value.testSentAt),
+    lastError: normalizeTextValue(value.lastError).slice(0, 500)
+  };
+  await kvs.set(MICROSOFT_CONNECTION_KEY, next);
+  return next;
+}
+
+function secretExpiryInfo(value='') {
+  const raw = normalizeTextValue(value);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return { date:'', days:null, warning:false, expired:false };
+  const end = new Date(`${raw}T23:59:59Z`);
+  if (Number.isNaN(end.getTime())) return { date:'', days:null, warning:false, expired:false };
+  const days = Math.ceil((end.getTime() - Date.now()) / 86400000);
+  return { date:raw, days, warning:days <= 60, expired:days < 0 };
+}
+
+function microsoftTokenRoles(token = '') {
+  try {
+    const part = String(token).split('.')[1];
+    if (!part) return [];
+    const normalized = part.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized + '='.repeat((4 - normalized.length % 4) % 4);
+    const payload = JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
+    return Array.isArray(payload.roles) ? payload.roles : [];
+  } catch {
+    return [];
+  }
+}
+
+function normalizeHexColor(value, fallback) {
+  const v = normalizeTextValue(value);
+  return /^#[0-9A-F]{6}$/i.test(v) ? v.toUpperCase() : fallback;
+}
+
+
+function normalizeLogoDataUri(value='') {
+  const v = String(value || '').trim();
+  if (!v) return '';
+  if (v.length > MAX_LOGO_DATA_LENGTH) throw new Error('Uploaded logo is too large. Please use a PNG or JPG under 140 KB.');
+  if (!/^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/i.test(v)) throw new Error('Uploaded logo must be a PNG or JPG image.');
+  return v;
+}
+
+function logoAttachmentFromBranding(branding = {}) {
+  const dataUri = branding?.logoDataUri || '';
+  const match = /^data:image\/(png|jpeg);base64,(.+)$/i.exec(dataUri);
+  if (!match) return null;
+  const ext = match[1].toLowerCase() === 'jpeg' ? 'jpg' : 'png';
+  return {
+    content: match[2],
+    type: `image/${match[1].toLowerCase()}`,
+    filename: branding.logoFileName || `system-alert-logo.${ext}`,
+    disposition: 'inline',
+    content_id: 'system-alert-logo'
+  };
+}
+
+function normalizeBranding(value = {}) {
+  return {
+    serviceName: normalizeTextValue(value.serviceName || DEFAULT_BRANDING.serviceName).slice(0, 80),
+    logoUrl: normalizeTextValue(value.logoUrl).slice(0, 500),
+    logoDataUri: normalizeLogoDataUri(value.logoDataUri),
+    logoFileName: normalizeTextValue(value.logoFileName).slice(0, 120),
+    headerBackground: normalizeHexColor(value.headerBackground, DEFAULT_BRANDING.headerBackground),
+    headerText: normalizeHexColor(value.headerText, DEFAULT_BRANDING.headerText),
+    accentColor: normalizeHexColor(value.accentColor, DEFAULT_BRANDING.accentColor),
+    pageBackground: normalizeHexColor(value.pageBackground, DEFAULT_BRANDING.pageBackground),
+    footerBackground: normalizeHexColor(value.footerBackground, DEFAULT_BRANDING.footerBackground),
+    footerText: normalizeTextValue(value.footerText || DEFAULT_BRANDING.footerText).slice(0, 500),
+    supportLabel: normalizeTextValue(value.supportLabel).slice(0, 80),
+    supportUrl: normalizeTextValue(value.supportUrl).slice(0, 500)
+  };
+}
+
+function templateType(alertType='initial') {
+  return ['initial','update','resolved','monthly-test'].includes(alertType) ? alertType : 'initial';
+}
+
+function templateContext(a = {}) {
+  const summary = subjectSummary(a);
+  const startTime = a.startTime || 'Not specified';
+  const nextUpdate = a.alertType === 'resolved' ? 'No further update planned' : (a.nextUpdate || 'To be confirmed');
+  const ctx = {
+    priority: a.priorityLabel || a.priority || 'Priority',
+    jiraPriority: a.priority || '',
+    clientCode: a.clientCode || '',
+    issueKey: a.issueKey || '',
+    summary,
+    startTime,
+    nextUpdate,
+    message: a.message || a.summary || '',
+    testMonth: a.testMonth || monthLabel(),
+    referenceLine: a.issueKey ? `Reference: ${a.issueKey}\n` : ''
+  };
+  for (const [token, value] of Object.entries(a.templateFields || {})) ctx[`field.${token}`] = value ?? '';
+  return ctx;
+}
+
+function renderTemplate(value, a = {}) {
+  const ctx = templateContext(a);
+  return String(value || '').replace(/{{\s*([a-zA-Z0-9._-]+)\s*}}/g, (_, key) => Object.prototype.hasOwnProperty.call(ctx, key) ? String(ctx[key] ?? '') : `{{${key}}}`);
+}
+
+async function getContact(id) { return await kvs.getSecret(`system-alert:contact:${id}`); }
+async function getAllContacts() {
+  const ids = (await kvs.get(CONTACT_INDEX)) || [];
+  // Read secrets in small batches so large contact lists do not fire hundreds
+  // of concurrent storage calls and trip Forge rate limits.
+  const rows = [];
+  for (let i = 0; i < ids.length; i += CONTACT_READ_CONCURRENCY) {
+    rows.push(...await Promise.all(ids.slice(i, i + CONTACT_READ_CONCURRENCY).map(getContact)));
+  }
+  return rows.filter(Boolean);
+}
+
+// Alert history no longer records the Atlassian account ID of the sender, so
+// the app stores no personal data about Atlassian users. Entries written by
+// earlier versions are stripped when read, rewritten, or by the one-time scrub.
+function withoutAccountIds(entries) {
+  if (!Array.isArray(entries)) return [];
+  return entries.map(entry => {
+    if (!entry || typeof entry !== 'object' || !('senderAccountId' in entry)) return entry;
+    const { senderAccountId, ...rest } = entry;
+    return rest;
+  });
+}
+
+async function readHistory(key) {
+  return withoutAccountIds(await kvs.get(key));
+}
+
+async function scrubLegacyHistoryAccountIds({ maxPages = 10 } = {}) {
+  const state = (await kvs.get(HISTORY_SCRUB_KEY)) || {};
+  if (state.done) return state;
+  let prefixIndex = Number(state.prefixIndex || 0);
+  let cursor = state.cursor || undefined;
+  let scrubbed = Number(state.scrubbed || 0);
+  for (let page = 0; page < maxPages && prefixIndex < HISTORY_PREFIXES.length; page++) {
+    let query = kvs.query().where('key', WhereConditions.beginsWith(HISTORY_PREFIXES[prefixIndex])).limit(100);
+    if (cursor) query = query.cursor(cursor);
+    const { results = [], nextCursor } = await query.getMany();
+    for (const { key, value } of results) {
+      if (Array.isArray(value) && value.some(e => e && typeof e === 'object' && 'senderAccountId' in e)) {
+        await kvs.set(key, withoutAccountIds(value));
+        scrubbed++;
+      }
+    }
+    if (nextCursor) cursor = nextCursor;
+    else { prefixIndex++; cursor = undefined; }
+  }
+  const next = prefixIndex >= HISTORY_PREFIXES.length
+    ? { done: true, scrubbed, at: new Date().toISOString() }
+    : { done: false, prefixIndex, cursor: cursor || null, scrubbed };
+  await kvs.set(HISTORY_SCRUB_KEY, next);
+  return next;
+}
+
+const normalizeTextValue = (v) => {
+  if (v == null) return '';
+  if (typeof v === 'string' || typeof v === 'number') return String(v).trim();
+  if (typeof v === 'object') return String(v.value ?? v.label ?? v.name ?? v.displayName ?? '').trim();
+  return String(v).trim();
+};
+
+const normalizePriorities = (v) => {
+  const arr = Array.isArray(v) ? v : (v ? [v] : []);
+  return arr.map(normalizeTextValue).filter(Boolean);
+};
+
+const normalizeOptionalFieldMappings = (value) => {
+  const raw = Array.isArray(value) ? value : [];
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    const fieldId = normalizeTextValue(item?.fieldId);
+    const label = normalizeTextValue(item?.label).slice(0, 80);
+    let token = normalizeTextValue(item?.token).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
+    if (!fieldId) continue;
+    if (!token) token = `field${out.length + 1}`;
+    const key = token.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ fieldId, label, token });
+  }
+  return out.slice(0, 20);
+};
+
+function mappedTemplateFields(issueFields = {}, settings = {}) {
+  const out = {};
+  for (const m of normalizeOptionalFieldMappings(settings.optionalFieldMappings)) out[m.token] = fieldText(issueFields[m.fieldId]);
+  return out;
+}
+
+const normalizePriorityConfigs = (value) => {
+  const raw = Array.isArray(value) ? value : [];
+  const seen = new Set();
+  const rows = [];
+  for (const item of raw) {
+    const name = normalizeTextValue(typeof item === 'object' ? item.name : item);
+    if (!name) continue;
+    const key = name.toUpperCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const label = normalizeTextValue(typeof item === 'object' ? item.label : '') || name;
+    const colorRaw = normalizeTextValue(typeof item === 'object' ? item.color : '');
+    const color = /^#[0-9A-F]{6}$/i.test(colorRaw) ? colorRaw.toUpperCase() : '#0C66E4';
+    rows.push({ name, label, color });
+  }
+  return rows.length ? rows : [
+    { name: 'P1', label: 'P1', color: '#AE2E24' },
+    { name: 'P2', label: 'P2', color: '#B65C02' }
+  ];
+};
+
+const priorityKey = (value='') => normalizeTextValue(value).toUpperCase();
+const enabledPriorityNames = (settings) => normalizePriorityConfigs(settings?.priorityConfigs).map(p => p.name);
+const isEnabledPriority = (settings, priority) => {
+  const key = priorityKey(priority);
+  return normalizePriorityConfigs(settings?.priorityConfigs).some(p => priorityKey(p.name) === key);
+};
+const getPriorityConfig = (settings, priority) => {
+  const key = priorityKey(priority);
+  return normalizePriorityConfigs(settings?.priorityConfigs).find(p => priorityKey(p.name) === key) || { name: normalizeTextValue(priority), label: normalizeTextValue(priority), color: '#0C66E4' };
+};
+
+async function syncDisplayProperty(settings) {
+  const value = {
+    projectKey: normalizeTextValue(settings.allowedProjectKey),
+    priorities: enabledPriorityNames(settings)
+  };
+  const res = await api.asApp().requestJira(route`/rest/forge/1/app/properties/${DISPLAY_PROPERTY_KEY}`, {
+    method: 'PUT',
+    headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify(value)
+  });
+  if (!res.ok) throw new Error(`Could not update System Alert display configuration (${res.status}): ${await res.text()}`);
+  return value;
+}
+
+function extractClientCode(raw='') {
+  const value = normalizeTextValue(raw).toUpperCase();
+  return value.includes(' - ') ? value.split(' - ')[0].trim() : value.trim();
+}
+function clientIdentity(raw) {
+  const value = normalizeTextValue(raw);
+  const optionId = raw && typeof raw === 'object' ? String(raw.id || '') : '';
+  const code = extractClientCode(value);
+  const name = value.includes(' - ') ? value.split(' - ').slice(1).join(' - ').trim() : value;
+  return { optionId, value, code, name };
+}
+async function getJiraFields() {
+  const res = await api.asUser().requestJira(route`/rest/api/3/field`);
+  if (!res.ok) throw new Error(`Could not read Jira fields (${res.status}).`);
+  const fields = await res.json();
+  return (Array.isArray(fields) ? fields : []).map(f => ({
+    id: String(f.id || ''),
+    name: normalizeTextValue(f.name),
+    custom: Boolean(f.custom),
+    schemaType: normalizeTextValue(f.schema?.type),
+    schemaCustom: normalizeTextValue(f.schema?.custom)
+  })).filter(f => f.id && f.name).sort((a,b) => a.name.localeCompare(b.name));
+}
+
+async function getJiraProjects() {
+  const projects = [];
+  let startAt = 0;
+  while (true) {
+    const res = await api.asUser().requestJira(route`/rest/api/3/project/search?startAt=${startAt}&maxResults=100&orderBy=name`);
+    if (!res.ok) throw new Error(`Could not read Jira projects (${res.status}).`);
+    const page = await res.json();
+    for (const p of page.values || []) {
+      const key = normalizeTextValue(p.key);
+      const name = normalizeTextValue(p.name);
+      if (key && !projects.some(x => x.key === key)) projects.push({ id:String(p.id || ''), key, name:name || key });
+    }
+    const values = page.values || [];
+    if (page.isLast || !values.length || startAt + values.length >= Number(page.total || 0)) break;
+    startAt += values.length;
+  }
+  return projects.sort((a,b) => a.name.localeCompare(b.name));
+}
+
+async function getClientOptions(fieldId) {
+  if (!fieldId) return [];
+  const contextsRes = await api.asUser().requestJira(route`/rest/api/3/field/${fieldId}/context?maxResults=100`);
+  if (!contextsRes.ok) throw new Error(`Could not read client field contexts (${contextsRes.status}).`);
+  const contexts = (await contextsRes.json()).values || [];
+  const options = [];
+  for (const ctx of contexts) {
+    let startAt = 0;
+    while (true) {
+      const res = await api.asUser().requestJira(route`/rest/api/3/field/${fieldId}/context/${ctx.id}/option?startAt=${startAt}&maxResults=100`);
+      if (!res.ok) throw new Error(`Could not read client field options (${res.status}).`);
+      const page = await res.json();
+      for (const o of page.values || []) {
+        if (o.disabled) continue;
+        const ident = clientIdentity({ id:o.id, value:o.value });
+        if (ident.value && !options.some(x => x.optionId === ident.optionId)) options.push(ident);
+      }
+      if (page.isLast || !(page.values || []).length) break;
+      startAt += (page.values || []).length;
+    }
+  }
+  return options.sort((a,b) => a.value.localeCompare(b.value));
+}
+async function providerStatus() {
+  const cfg = await getProviderSettings();
+  const emailProvider = cfg.emailProvider === 'microsoft365' ? 'microsoft365' : 'sendgrid';
+  const sendgridApiKey = (await getProviderSecret('sendgridApiKey')) || process.env.SENDGRID_API_KEY || '';
+  const sendgridFromEmail = cfg.sendgridFromEmail || process.env.ALERT_FROM_EMAIL || '';
+  const msMode = cfg.microsoftMode === 'enterprise' ? 'enterprise' : 'marketplace';
+  const enterpriseSecret = await getProviderSecret('microsoftClientSecret');
+  const marketplaceClientId = process.env.MICROSOFT_MARKETPLACE_CLIENT_ID || '';
+  const marketplaceClientSecret = process.env.MICROSOFT_MARKETPLACE_CLIENT_SECRET || '';
+  const marketplaceRedirectUri = process.env.MICROSOFT_MARKETPLACE_REDIRECT_URI || '';
+  const msConnection = await getMicrosoftConnectionState();
+  const marketplaceConnectionMatches = msConnection.status === 'connected' && msConnection.mode !== 'enterprise' &&
+    normalizeTextValue(msConnection.tenantId) === normalizeTextValue(cfg.microsoftTenantId) &&
+    normalizeTextValue(msConnection.senderMailbox).toLowerCase() === normalizeTextValue(cfg.microsoftSenderMailbox).toLowerCase();
+  const enterpriseConnectionMatches = msConnection.status === 'connected' && msConnection.mode === 'enterprise' &&
+    normalizeTextValue(msConnection.tenantId) === normalizeTextValue(cfg.microsoftTenantId) &&
+    normalizeTextValue(msConnection.clientId) === normalizeTextValue(cfg.microsoftClientId) &&
+    normalizeTextValue(msConnection.senderMailbox).toLowerCase() === normalizeTextValue(cfg.microsoftSenderMailbox).toLowerCase();
+  const msCredentialsReady = msMode === 'marketplace'
+    ? Boolean(marketplaceClientId && marketplaceClientSecret)
+    : Boolean(cfg.microsoftTenantId && cfg.microsoftClientId && cfg.microsoftSenderMailbox && enterpriseSecret);
+  const msConfigured = msMode === 'marketplace'
+    ? Boolean(cfg.microsoftTenantId && cfg.microsoftSenderMailbox && msCredentialsReady && marketplaceConnectionMatches)
+    : Boolean(msCredentialsReady && enterpriseConnectionMatches);
+  const connected = msMode === 'marketplace' ? marketplaceConnectionMatches : enterpriseConnectionMatches;
+  const expiry = secretExpiryInfo(cfg.microsoftClientSecretExpiry);
+  const twilioAccountSid = (await getProviderSecret('twilioAccountSid')) || process.env.TWILIO_ACCOUNT_SID || '';
+  const twilioPassword = (await getProviderSecret('twilioApiSecret')) || (await getProviderSecret('twilioAuthToken')) || process.env.TWILIO_API_SECRET || process.env.TWILIO_AUTH_TOKEN || '';
+  const twilioSender = cfg.twilioMessagingServiceSid || cfg.twilioFromNumber || process.env.TWILIO_MESSAGING_SERVICE_SID || process.env.TWILIO_FROM_NUMBER || '';
+  const email = emailProvider === 'microsoft365'
+    ? { configured: msConfigured, provider: 'Microsoft 365', from: cfg.microsoftSenderMailbox || '', source: msMode === 'marketplace' ? (marketplaceConnectionMatches ? 'Easy Connect' : 'Easy Connect — consent required') : (enterpriseSecret ? 'Customer Entra application' : ''), connectionMode: msMode, marketplaceAvailable:Boolean(marketplaceClientId && marketplaceClientSecret), consentAvailable:Boolean(marketplaceClientId && marketplaceRedirectUri), connected, verifiedAt: connected ? msConnection.verifiedAt || '' : '', testSentAt: connected ? msConnection.testSentAt || '' : '', lastError: msConnection.lastError || '', secretExpiry: expiry.date, secretExpiryDays: expiry.days, secretExpiryWarning: expiry.warning, secretExpired: expiry.expired }
+    : { configured: Boolean(sendgridApiKey && sendgridFromEmail), provider: 'SendGrid', from: sendgridFromEmail, source: (await getProviderSecret('sendgridApiKey')) ? 'App settings' : (process.env.SENDGRID_API_KEY ? 'Forge environment' : '') };
+  return {
+    email,
+    sms: { configured: Boolean(twilioAccountSid && twilioPassword && twilioSender), provider: 'Twilio', sender: twilioSender, source: (await getProviderSecret('twilioAccountSid')) ? 'App settings' : (process.env.TWILIO_ACCOUNT_SID ? 'Forge environment' : '') }
+  };
+}
+
+async function microsoftMarketplaceSetup(cfgInput = null) {
+  const cfg = cfgInput || await getProviderSettings();
+  const clientId = process.env.MICROSOFT_MARKETPLACE_CLIENT_ID || '';
+  const clientSecret = process.env.MICROSOFT_MARKETPLACE_CLIENT_SECRET || '';
+  const redirectUri = process.env.MICROSOFT_MARKETPLACE_REDIRECT_URI || '';
+  const available = Boolean(clientId && clientSecret && redirectUri);
+  const connection = await getMicrosoftConnectionState();
+  const connected = connection.status === 'connected';
+  let consentUrl = '';
+  if (available) {
+    const q = new URLSearchParams({ client_id: clientId, scope: 'https://graph.microsoft.com/.default', redirect_uri: redirectUri, state: 'system-alert-manager' });
+    consentUrl = `https://login.microsoftonline.com/organizations/v2.0/adminconsent?${q.toString()}`;
+  }
+  let message = '';
+  if (!available) message = 'Publisher-side Microsoft connection is not configured in this Forge environment yet. No customer Tenant ID, Client ID or secret is required for Easy Connect.';
+  else if (connected) message = 'Microsoft 365 connection is active.';
+  else message = 'Ready to connect. Microsoft will identify the organisation during the connection flow.';
+  return { available, connected, consentUrl, redirectConfigured:Boolean(redirectUri), tenantConfigured:Boolean(connection.tenantId), senderConfigured:Boolean(connection.senderMailbox || cfg.microsoftSenderMailbox), tenantId:connection.tenantId || '', organisationName:connection.organisationName || '', senderMailbox:connection.senderMailbox || cfg.microsoftSenderMailbox || '', verifiedAt:connected ? connection.verifiedAt || '' : '', testSentAt:connected ? connection.testSentAt || '' : '', message };
+}
+
+
+
+resolver.define('getAdminData', async () => {
+  const settings = await getSettings();
+  const [contactsRaw, jiraFields, jiraProjects, providers, providerSettings, templates, branding, microsoftMarketplace] = await Promise.all([
+    getAllContacts(), getJiraFields(), getJiraProjects(), providerStatus(), getProviderSettings(), getTemplates(), getBranding(), microsoftMarketplaceSetup()
+  ]);
+  const clientOptions = settings.clientFieldId ? await getClientOptions(settings.clientFieldId) : [];
+  const contacts = contactsRaw.map(c => ({ ...c, mobile: '', mobileMasked: maskPhone(normalizeTextValue(c.mobile)) }));
+  const monthlyClients = [...new Set(contactsRaw.filter(c => c.active !== false && c.monthlyTestAlerts && c.clientCode).map(c => c.clientCode))].sort();
+  const autoTestClients = [];
+  for (const clientCode of monthlyClients) {
+    const history = await readHistory(`system-alert:test-history:${clientCode}`);
+    const eligible = contactsRaw.filter(c => c.active !== false && c.monthlyTestAlerts && normalizeTextValue(c.clientCode).toUpperCase() === clientCode);
+    const emailCount = new Set(eligible.filter(c => c.emailAlerts === true && normalizeTextValue(c.email)).map(c => normalizeTextValue(c.email).toLowerCase())).size;
+    const smsCount = new Set(eligible.filter(c => c.smsAlerts === true && normalizeTextValue(c.mobile)).map(c => normalizeTextValue(c.mobile))).size;
+    autoTestClients.push({
+      clientCode,
+      last: Array.isArray(history) && history.length ? history[0] : null,
+      contactCount: eligible.length,
+      emailCount,
+      smsCount
+    });
+  }
+  const schedulerStatus = (await kvs.get(SCHEDULER_STATUS_KEY)) || {};
+  const setupStatus = {
+    jira: Boolean(settings.allowedProjectKey && settings.clientFieldId && enabledPriorityNames(settings).length),
+    clients: clientOptions.length > 0,
+    email: Boolean(providers.email?.configured),
+    sms: Boolean(providers.sms?.configured),
+    contacts: contacts.length
+  };
+  return {
+    appVersion: APP_VERSION,
+    settings, contacts, clientOptions, jiraFields, jiraProjects,
+    providerStatus: providers, providerSettings, microsoftMarketplace,
+    templates, branding, setupStatus,
+    autoTestStatus: { enabled: settings.monthlyTestEnabled !== false, hour: Number(settings.monthlyTestHour ?? 10), clients: autoTestClients, scheduler: schedulerStatus }
+  };
+});
+
+resolver.define('saveSettings', async ({ payload }) => {
+  const current = await getSettings();
+  const next = {
+    ...current,
+    clientFieldId: normalizeTextValue(payload?.clientFieldId),
+    issueStartFieldId: normalizeTextValue(payload?.issueStartFieldId),
+    nextUpdateFieldId: normalizeTextValue(payload?.nextUpdateFieldId),
+    optionalFieldMappings: normalizeOptionalFieldMappings(payload?.optionalFieldMappings),
+    allowedProjectKey: normalizeTextValue(payload?.allowedProjectKey),
+    fromName: normalizeTextValue(payload?.fromName || current.fromName || 'Service Desk').slice(0, 80),
+    replyToEmail: normalizeTextValue(payload?.replyToEmail).slice(0, 254),
+    priorityConfigs: normalizePriorityConfigs(payload?.priorityConfigs),
+    monthlyTestEnabled: payload?.monthlyTestEnabled !== false,
+    monthlyTestHour: Math.max(0, Math.min(23, Number.isFinite(Number(payload?.monthlyTestHour)) ? Number(payload.monthlyTestHour) : 10))
+  };
+  await kvs.set(SETTINGS_KEY, next);
+  await syncDisplayProperty(next);
+  return next;
+});
+
+resolver.define('saveProviderSettings', async ({ payload }) => {
+  const current = await getProviderSettings();
+  const previousEnterpriseIdentity = `${normalizeTextValue(current.microsoftTenantId)}|${normalizeTextValue(current.microsoftClientId)}|${normalizeTextValue(current.microsoftSenderMailbox).toLowerCase()}`;
+  const next = {
+    ...current,
+    emailProvider: payload?.emailProvider === 'microsoft365' ? 'microsoft365' : 'sendgrid',
+    sendgridFromEmail: normalizeTextValue(payload?.sendgridFromEmail).slice(0,254),
+    sendgridFromName: normalizeTextValue(payload?.sendgridFromName || 'Service Desk').slice(0,80),
+    sendgridReplyToEmail: normalizeTextValue(payload?.sendgridReplyToEmail).slice(0,254),
+    microsoftMode: payload?.microsoftMode === 'enterprise' ? 'enterprise' : 'marketplace',
+    microsoftTenantId: normalizeTextValue(payload?.microsoftTenantId).slice(0,100),
+    microsoftClientId: normalizeTextValue(payload?.microsoftClientId).slice(0,100),
+    microsoftSenderMailbox: normalizeTextValue(payload?.microsoftSenderMailbox).slice(0,254),
+    microsoftFromName: normalizeTextValue(payload?.microsoftFromName || 'Service Desk').slice(0,80),
+    microsoftReplyToEmail: normalizeTextValue(payload?.microsoftReplyToEmail).slice(0,254),
+    microsoftClientSecretExpiry: /^\d{4}-\d{2}-\d{2}$/.test(normalizeTextValue(payload?.microsoftClientSecretExpiry)) ? normalizeTextValue(payload.microsoftClientSecretExpiry) : '',
+    smsProvider: 'twilio',
+    twilioRegion: ['global','ie1'].includes(normalizeTextValue(payload?.twilioRegion).toLowerCase()) ? normalizeTextValue(payload.twilioRegion).toLowerCase() : 'global',
+    twilioFromNumber: normalizeTextValue(payload?.twilioFromNumber).slice(0,40),
+    twilioMessagingServiceSid: normalizeTextValue(payload?.twilioMessagingServiceSid).slice(0,80)
+  };
+  await kvs.set(PROVIDER_SETTINGS_KEY, next);
+  for (const name of Object.keys(PROVIDER_SECRET_KEYS)) {
+    const value = normalizeTextValue(payload?.[name]);
+    if (value) await kvs.setSecret(PROVIDER_SECRET_KEYS[name], value);
+  }
+  const nextEnterpriseIdentity = `${normalizeTextValue(next.microsoftTenantId)}|${normalizeTextValue(next.microsoftClientId)}|${normalizeTextValue(next.microsoftSenderMailbox).toLowerCase()}`;
+  if (next.microsoftMode === 'enterprise' && (previousEnterpriseIdentity !== nextEnterpriseIdentity || normalizeTextValue(payload?.microsoftClientSecret))) {
+    const connection = await getMicrosoftConnectionState();
+    if (connection.mode === 'enterprise') await kvs.delete(MICROSOFT_CONNECTION_KEY);
+  }
+  return { settings: next, status: await providerStatus(), microsoftMarketplace: await microsoftMarketplaceSetup(next) };
+});
+
+resolver.define('startMicrosoftMarketplaceConnection', async () => {
+  const setup = await microsoftMarketplaceSetup();
+  if (!setup.available || !setup.consentUrl) throw new Error(setup.message || 'Microsoft 365 Easy Connect is not available in this environment yet.');
+  return { consentUrl: setup.consentUrl, message: setup.message };
+});
+
+resolver.define('getMicrosoftMarketplaceSetup', async () => {
+  return await microsoftMarketplaceSetup();
+});
+
+
+resolver.define('saveMicrosoftMarketplaceSettings', async ({ payload }) => {
+  const current = await getProviderSettings();
+  const tenantId = normalizeTextValue(payload?.microsoftTenantId);
+  const senderMailbox = normalizeTextValue(payload?.microsoftSenderMailbox);
+  if (!tenantId) throw new Error('Enter the Microsoft Tenant ID.');
+  if (!senderMailbox || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(senderMailbox)) throw new Error('Enter a valid Microsoft 365 sender mailbox.');
+  const oldIdentity = `${normalizeTextValue(current.microsoftTenantId)}|${normalizeTextValue(current.microsoftSenderMailbox).toLowerCase()}`;
+  const next = {
+    ...current,
+    emailProvider: 'microsoft365',
+    microsoftMode: 'marketplace',
+    microsoftTenantId: tenantId,
+    microsoftSenderMailbox: senderMailbox,
+    microsoftFromName: normalizeTextValue(payload?.microsoftFromName) || current.microsoftFromName || 'Service Desk',
+    microsoftReplyToEmail: normalizeTextValue(payload?.microsoftReplyToEmail) || senderMailbox
+  };
+  await kvs.set(PROVIDER_SETTINGS_KEY, next);
+  const newIdentity = `${tenantId}|${senderMailbox.toLowerCase()}`;
+  if (oldIdentity !== newIdentity) await kvs.delete(MICROSOFT_CONNECTION_KEY);
+  return { settings: next, microsoftMarketplace: await microsoftMarketplaceSetup(next), status: await providerStatus() };
+});
+
+resolver.define('verifyMicrosoftMarketplaceConnection', async () => {
+  const cfg = await getProviderSettings();
+  if (cfg.microsoftMode === 'enterprise') throw new Error('Easy Connect is not selected.');
+  if (!normalizeTextValue(cfg.microsoftTenantId) || !normalizeTextValue(cfg.microsoftSenderMailbox)) throw new Error('Save the Microsoft Tenant ID and sender mailbox first.');
+  try {
+    const token = await getMicrosoftAccessToken(cfg);
+    const roles = microsoftTokenRoles(token);
+    if (!roles.includes('Mail.Send')) throw new Error('Microsoft returned a token, but Mail.Send application permission is not present. Ask a Microsoft administrator to grant consent, then try Verify again.');
+    const previous = await getMicrosoftConnectionState();
+    await saveMicrosoftConnectionState({
+      status: 'connected',
+      tenantId: cfg.microsoftTenantId,
+      senderMailbox: cfg.microsoftSenderMailbox,
+      verifiedAt: new Date().toISOString(),
+      testSentAt: previous.testSentAt || '',
+      lastError: ''
+    });
+    return { ok: true, microsoftMarketplace: await microsoftMarketplaceSetup(cfg), status: await providerStatus() };
+  } catch (e) {
+    await saveMicrosoftConnectionState({ status:'disconnected', tenantId:cfg.microsoftTenantId, senderMailbox:cfg.microsoftSenderMailbox, lastError:e?.message || String(e) });
+    throw e;
+  }
+});
+
+resolver.define('disconnectMicrosoftMarketplace', async () => {
+  await kvs.delete(MICROSOFT_CONNECTION_KEY);
+  return { ok:true, microsoftMarketplace: await microsoftMarketplaceSetup(), status: await providerStatus() };
+});
+
+
+resolver.define('verifyMicrosoftEnterpriseConnection', async () => {
+  const cfg = await getProviderSettings();
+  if (cfg.emailProvider !== 'microsoft365' || cfg.microsoftMode !== 'enterprise') throw new Error('Select Microsoft 365 and Enterprise manual first.');
+  if (!normalizeTextValue(cfg.microsoftTenantId) || !normalizeTextValue(cfg.microsoftClientId) || !normalizeTextValue(cfg.microsoftSenderMailbox)) throw new Error('Save the Tenant ID, Client ID and sender mailbox first.');
+  if (!(await getProviderSecret('microsoftClientSecret'))) throw new Error('Save the Microsoft Client Secret value first.');
+  try {
+    const token = await getMicrosoftAccessToken(cfg);
+    const roles = microsoftTokenRoles(token);
+    if (!roles.includes('Mail.Send')) throw new Error('Microsoft authentication succeeded, but the access token does not contain the Mail.Send application permission. Ask your Microsoft administrator to confirm Application → Mail.Send has admin consent.');
+    const previous = await getMicrosoftConnectionState();
+    await saveMicrosoftConnectionState({
+      status:'connected', mode:'enterprise', tenantId:cfg.microsoftTenantId, clientId:cfg.microsoftClientId,
+      senderMailbox:cfg.microsoftSenderMailbox, verifiedAt:new Date().toISOString(), testSentAt:previous.testSentAt || '', lastError:''
+    });
+    return { ok:true, status:await providerStatus() };
+  } catch (e) {
+    await saveMicrosoftConnectionState({ status:'disconnected', mode:'enterprise', tenantId:cfg.microsoftTenantId, clientId:cfg.microsoftClientId, senderMailbox:cfg.microsoftSenderMailbox, lastError:e?.message || String(e) });
+    throw e;
+  }
+});
+
+resolver.define('disconnectMicrosoftEnterprise', async () => {
+  const current = await getMicrosoftConnectionState();
+  if (current.mode === 'enterprise') await kvs.delete(MICROSOFT_CONNECTION_KEY);
+  return { ok:true, status:await providerStatus() };
+});
+
+resolver.define('testEmailProvider', async ({ payload }) => {
+  const to = normalizeTextValue(payload?.recipient);
+  if (!to || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(to)) throw new Error('Enter a valid test recipient email address.');
+  const branding = await getBranding();
+  const settings = await getSettings();
+  const a = { alertType:'initial', issueKey:'TEST-EMAIL', clientCode:'TEST', priority:'P1', priorityLabel:'P1', priorityConfig:{name:'P1',label:'P1',color:'#AE2E24'}, summary:'System Alert email provider test', startTime:formatDateTime(new Date().toISOString()), nextUpdate:'Not applicable', message:'This is a test email from System Alert Manager.', fromName:settings.fromName };
+  const templates = await getTemplates();
+  await sendEmail([to], 'TEST ONLY | System Alert Manager email configuration', buildEmailHtml(a, templates, branding), buildEmailText(a, templates), settings.fromName, settings.replyToEmail, branding);
+  const cfg = await getProviderSettings();
+  if (cfg.emailProvider === 'microsoft365') {
+    const previous = await getMicrosoftConnectionState();
+    await saveMicrosoftConnectionState({ status:'connected', mode:cfg.microsoftMode === 'enterprise' ? 'enterprise' : 'marketplace', tenantId:cfg.microsoftTenantId, clientId:cfg.microsoftClientId, senderMailbox:cfg.microsoftSenderMailbox, verifiedAt:previous.verifiedAt || new Date().toISOString(), testSentAt:new Date().toISOString(), lastError:'' });
+  }
+  return { ok:true };
+});
+
+resolver.define('saveTemplates', async ({ payload }) => {
+  const current = await getTemplates();
+  const next = { ...current };
+  for (const type of ['initial','update','resolved','monthly-test']) {
+    if (!payload?.[type]) continue;
+    next[type] = {
+      ...current[type],
+      subject: String(payload[type].subject ?? current[type].subject).trim(),
+      intro: String(payload[type].intro ?? current[type].intro).trim(),
+      followup: String(payload[type].followup ?? current[type].followup).trim(),
+      sms: String(payload[type].sms ?? current[type].sms).trim()
+    };
+  }
+  await kvs.set(TEMPLATE_SETTINGS_KEY, next);
+  return next;
+});
+
+resolver.define('resetTemplates', async () => {
+  await kvs.delete(TEMPLATE_SETTINGS_KEY);
+  return await getTemplates();
+});
+
+resolver.define('saveBranding', async ({ payload }) => {
+  const branding = normalizeBranding(payload || {});
+  await kvs.set(BRANDING_SETTINGS_KEY, branding);
+  return branding;
+});
+
+resolver.define('resetBranding', async () => {
+  await kvs.delete(BRANDING_SETTINGS_KEY);
+  return await getBranding();
+});
+
+resolver.define('previewTemplate', async ({ payload }) => {
+  const type = templateType(payload?.templateType || 'initial');
+  const templates = await getTemplates();
+  const draftTemplate = payload?.template || {};
+  const mergedTemplates = { ...templates, [type]: { ...templates[type], ...draftTemplate } };
+  const branding = normalizeBranding(payload?.branding || await getBranding());
+  const settings = await getSettings();
+  const priorityConfig = getPriorityConfig(settings, 'P1');
+  const a = {
+    alertType: type,
+    issueKey: 'SD-12345',
+    clientCode: 'CLIENT',
+    priority: 'P1',
+    priorityLabel: priorityConfig.label || 'P1',
+    priorityConfig,
+    summary: 'Example customer-facing incident',
+    startTime: '17 Aug 2026 09:00',
+    nextUpdate: '10:00 Irish time',
+    message: type === 'monthly-test' ? 'Scheduled monthly communications test.' : 'Customers are currently experiencing an interruption to the affected service.',
+    testMonth: 'August 2026',
+    fromName: branding.serviceName || settings.fromName || 'Service Desk',
+    templateFields: Object.fromEntries((settings.optionalFieldMappings || []).map(m => [m.token, `Example ${m.label || m.token}`]))
+  };
+  return {
+    subject: buildEmailSubject(a, mergedTemplates),
+    html: buildEmailHtml(a, mergedTemplates, branding),
+    text: buildEmailText(a, mergedTemplates),
+    sms: buildSmsText(a, mergedTemplates),
+    model: buildPreviewModel(a, mergedTemplates, branding)
+  };
+});
+
+resolver.define('saveContact', async ({ payload }) => {
+  const settings = await getSettings();
+  const id = payload.id || safeId();
+  const options = await getClientOptions(settings.clientFieldId);
+  const selectedClient = options.find(o => String(o.optionId) === String(payload.clientOptionId || ''));
+  if (!selectedClient) throw new Error('Select a valid client from the configured Jira Client field.');
+  const contact = {
+    id,
+    clientOptionId: selectedClient.optionId,
+    clientValue: selectedClient.value,
+    clientCode: selectedClient.code,
+    clientName: selectedClient.name,
+    name: String(payload.name || '').trim(),
+    email: normalizeTextValue(payload.email),
+    mobile: normalizeTextValue(payload.mobile),
+    priorities: normalizePriorities(payload.priorities).filter(p => isEnabledPriority(settings, p)),
+    emailAlerts: payload.emailAlerts === true,
+    smsAlerts: payload.smsAlerts === true,
+    monthlyTestAlerts: payload.monthlyTestAlerts === true,
+    active: payload.active !== false
+  };
+  if (!contact.clientCode || !contact.name) throw new Error('Client and contact name are required.');
+  const existing = await getAllContacts();
+  const duplicate = existing.find(c => c.id !== id && String(c.clientOptionId || '') === String(contact.clientOptionId) && ((contact.email && normalizeTextValue(c.email).toLowerCase() === contact.email.toLowerCase()) || (contact.mobile && normalizeTextValue(c.mobile) === contact.mobile)));
+  if (duplicate) throw new Error('A contact with this email address or mobile number already exists for the selected client.');
+  await kvs.setSecret(`system-alert:contact:${id}`, contact);
+  const ids = (await kvs.get(CONTACT_INDEX)) || [];
+  if (!ids.includes(id)) await kvs.set(CONTACT_INDEX, [...ids, id]);
+  return { ...contact, mobileMasked: maskPhone(contact.mobile) };
+});
+
+resolver.define('testContact', async ({ payload }) => {
+  const settings = await getSettings();
+  const c = await getContact(payload.id);
+  if (!c) throw new Error('Contact not found.');
+  const channel = payload.channel;
+  if (channel === 'email') {
+    if (!c.email) throw new Error('This contact has no email address.');
+    await sendEmail([c.email], 'TEST ONLY | System Alert contact test', '<div style="font-family:Arial,sans-serif"><h2>System Alert contact test</h2><p>This is a test email from System Alert Manager. No live incident is in progress.</p></div>', 'System Alert contact test. No live incident is in progress.', settings.fromName, settings.replyToEmail);
+    return { ok:true, channel:'email' };
+  }
+  if (channel === 'sms') {
+    if (!c.mobile) throw new Error('This contact has no mobile number.');
+    await sendTwilio(c.mobile, 'TEST ONLY - System Alert contact test. No live incident is in progress.');
+    return { ok:true, channel:'sms' };
+  }
+  throw new Error('Choose Email or SMS test.');
+});
+
+resolver.define('deleteContact', async ({ payload }) => {
+  const ids = (await kvs.get(CONTACT_INDEX)) || [];
+  await kvs.deleteSecret(`system-alert:contact:${payload.id}`);
+  await kvs.set(CONTACT_INDEX, ids.filter(x => x !== payload.id));
+  return true;
+});
+
+resolver.define('getIssueAlertData', async ({ payload }) => {
+  const settings = await getSettings();
+  const fieldList = ['summary','description','priority','project'];
+  if (settings.clientFieldId) fieldList.push(settings.clientFieldId);
+  if (settings.issueStartFieldId) fieldList.push(settings.issueStartFieldId);
+  if (settings.nextUpdateFieldId) fieldList.push(settings.nextUpdateFieldId);
+  for (const m of settings.optionalFieldMappings || []) if (m.fieldId && !fieldList.includes(m.fieldId)) fieldList.push(m.fieldId);
+  const r = await api.asUser().requestJira(route`/rest/api/3/issue/${payload.issueKey}?fields=${fieldList.join(',')}`);
+  if (!r.ok) throw new Error(`Could not read Jira issue (${r.status}).`);
+  const issue = await r.json();
+  if (settings.allowedProjectKey && issue.fields.project?.key !== settings.allowedProjectKey) throw new Error('System Alert is not enabled for this project.');
+
+  const currentClient = settings.clientFieldId ? clientIdentity(issue.fields[settings.clientFieldId]) : { optionId:'', code:'', name:'', value:'' };
+  const clientCode = currentClient.code;
+  const priority = fieldText(issue.fields.priority) || '';
+  if (!isEnabledPriority(settings, priority)) throw new Error(`System Alert is not enabled for priority ${priority || 'Not set'}.`);
+  const priorityConfig = getPriorityConfig(settings, priority);
+  const issueStartTime = settings.issueStartFieldId ? formatDateTime(fieldText(issue.fields[settings.issueStartFieldId])) : '';
+  const nextUpdateDue = settings.nextUpdateFieldId ? formatDateTime(fieldText(issue.fields[settings.nextUpdateFieldId])) : '';
+  const templateFields = mappedTemplateFields(issue.fields, settings);
+  const all = await getAllContacts();
+  const contacts = all.map(c => ({
+    ...c,
+    clientCode: normalizeTextValue(c.clientCode).toUpperCase(),
+    name: normalizeTextValue(c.name),
+    email: normalizeTextValue(c.email),
+    mobile: normalizeTextValue(c.mobile),
+    priorities: normalizePriorities(c.priorities),
+    emailAlerts: c.emailAlerts === true,
+    smsAlerts: c.smsAlerts === true,
+    monthlyTestAlerts: c.monthlyTestAlerts === true,
+    active: c.active !== false
+  })).filter(c => c.active && ((currentClient.optionId && c.clientOptionId) ? String(c.clientOptionId) === String(currentClient.optionId) : c.clientCode === clientCode)).map(c => ({
+    id: c.id,
+    name: c.name,
+    email: c.email,
+    hasMobile: Boolean(c.mobile),
+    mobileMasked: maskPhone(c.mobile),
+    emailAlerts: c.emailAlerts,
+    smsAlerts: c.smsAlerts,
+    monthlyTestAlerts: c.monthlyTestAlerts,
+    priorities: c.priorities
+  }));
+
+  const history = await readHistory(`system-alert:history:${payload.issueKey}`);
+  const monthlyHistory = await readHistory(`system-alert:test-history:${clientCode}`);
+  const thisMonth = monthKey();
+  const monthlyTestCompleted = monthlyHistory.some(h => h.monthKey === thisMonth);
+
+  return {
+    issueKey: issue.key,
+    summary: issue.fields.summary || '',
+    description: adfToText(issue.fields.description).trim(),
+    priority,
+    priorityLabel: priorityConfig.label,
+    priorityColor: priorityConfig.color,
+    clientCode,
+    issueStartTime,
+    nextUpdateDue,
+    templateFields,
+    optionalFieldMappings: settings.optionalFieldMappings || [],
+    contacts,
+    history,
+    monthlyHistory,
+    monthlyTestCompleted,
+    monthlyTestMonth: monthLabel(),
+    settings: { emailEnabled: settings.emailEnabled, smsEnabled: settings.smsEnabled, fromName: settings.fromName, priorityConfigs: settings.priorityConfigs }
+  };
+});
+
+function emailPresentation(a) {
+  const isTest = a.alertType === 'monthly-test';
+  const isResolved = a.alertType === 'resolved';
+  const isUpdate = a.alertType === 'update';
+  const priority = String(a.priority || '').trim();
+  const priorityLabel = a.priorityLabel || a.priorityConfig?.label || priority || 'Priority';
+  const priorityColor = a.priorityConfig?.color || '#AE2E24';
+
+  if (isTest) return {
+    eyebrow: 'SYSTEM ALERT TEST', badge: 'TEST ONLY', accent: '#B65C02', soft: '#FFF7D6', border: '#E2B203',
+    title: 'Monthly System Alert Test', status: 'Scheduled test — no live service incident',
+    intro: 'This is a scheduled test of the Service Desk System Alert service. There is no live service incident.'
+  };
+  if (isResolved) return {
+    eyebrow: 'SERVICE STATUS', badge: 'SERVICE RESTORED', accent: '#216E4E', soft: '#DCFFF1', border: '#4BCE97',
+    title: a.summary || 'Service restored', status: 'Resolved / service restored',
+    intro: `The ${priorityLabel} incident has been resolved and service has been restored.`
+  };
+  const soft = priorityColor.toUpperCase() === '#B65C02' ? '#FFF3E0' : '#FFECEB';
+  const border = priorityColor.toUpperCase() === '#B65C02' ? '#F5A623' : priorityColor;
+  return {
+    eyebrow: isUpdate ? 'INCIDENT UPDATE' : 'SYSTEM ALERT',
+    badge: isUpdate ? `${priorityLabel} UPDATE` : `${priorityLabel} SYSTEM ALERT`,
+    accent: priorityColor, soft, border,
+    title: a.summary || `${priorityLabel} incident`,
+    status: isUpdate ? 'Incident update' : 'Investigation in progress',
+    intro: isUpdate ? `An update is available for this ${priorityLabel} incident.` : `A ${priorityLabel} issue has been identified and our priority escalation process has been initiated.`
+  };
+}
+
+
+function buildPreviewModel(a, templates = DEFAULT_TEMPLATES, brandingInput = DEFAULT_BRANDING) {
+  const p = emailPresentation(a);
+  const branding = normalizeBranding(brandingInput || DEFAULT_BRANDING);
+  const type = templateType(a.alertType);
+  const template = templates?.[type] || {};
+  const isTest = a.alertType === 'monthly-test';
+  const isResolved = a.alertType === 'resolved';
+  const defaultFollowup = isTest
+    ? 'No action is required unless acknowledgement is part of the agreed test process.'
+    : isResolved
+      ? 'No further incident updates are planned at this time. The Service Desk will continue to monitor the service.'
+      : 'Our support team is actively managing this incident. A further update will be provided by the time shown above, or sooner if there is a significant change.';
+  return {
+    issueKey: a.issueKey,
+    clientCode: a.clientCode,
+    priority: a.priority,
+    priorityLabel: a.priorityLabel || a.priority,
+    summary: a.summary,
+    alertType: a.alertType,
+    startTime: a.startTime,
+    nextUpdate: a.nextUpdate,
+    message: a.message,
+    testMonth: a.testMonth,
+    fromName: branding.serviceName || a.fromName || 'Service Desk',
+    presentation: p,
+    branding,
+    intro: renderTemplate(template.intro || p.intro, a),
+    followup: renderTemplate(template.followup || defaultFollowup, a),
+    footerText: renderTemplate(branding.footerText || DEFAULT_BRANDING.footerText, a),
+    supportLabel: branding.supportLabel || '',
+    supportUrl: branding.supportUrl || '',
+    logoUrl: branding.logoUrl || '',
+    logoSrc: branding.logoDataUri || branding.logoUrl || ''
+  };
+}
+
+function subjectSummary(a) {
+  const summary = String(a.summary || '').trim();
+  const client = String(a.clientCode || '').trim();
+  if (!client || !summary) return summary;
+  // Ticket summaries often already begin with the client code (for example "RYR - ...").
+  // Remove that prefix in the email subject so the client is not shown twice.
+  const escaped = client.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return summary.replace(new RegExp(`^${escaped}\\s*(?:[-–—:|]\\s*)`, 'i'), '').trim() || summary;
+}
+
+function buildEmailSubject(a, templates = DEFAULT_TEMPLATES) {
+  const type = templateType(a.alertType);
+  const configured = templates?.[type]?.subject;
+  if (configured) return renderTemplate(configured, a);
+  const summary = subjectSummary(a);
+  if (a.alertType === 'monthly-test') return `TEST ONLY | MONTHLY SYSTEM ALERT TEST | ${a.clientCode} | ${a.testMonth || monthLabel()}`;
+  if (a.alertType === 'resolved') return `SERVICE RESTORED | ${a.clientCode} | ${a.issueKey} | ${summary}`;
+  const priorityLabel = a.priorityLabel || a.priority;
+  if (a.alertType === 'update') return `${priorityLabel} UPDATE | ${a.clientCode} | ${a.issueKey} | ${summary}`;
+  return `${priorityLabel} SYSTEM ALERT | ${a.clientCode} | ${a.issueKey} | ${summary}`;
+}
+
+function buildEmailText(a, templates = DEFAULT_TEMPLATES) {
+  const p = emailPresentation(a);
+  const template = templates?.[templateType(a.alertType)] || {};
+  const intro = renderTemplate(template.intro || p.intro, a);
+  const defaultFollowup = a.alertType === 'monthly-test'
+    ? 'No action is required unless acknowledgement is part of the agreed test process.'
+    : a.alertType === 'resolved'
+      ? 'No further incident updates are planned at this time. The Service Desk will continue to monitor the service.'
+      : 'Our support team is actively managing this incident. A further update will be provided by the time shown above, or sooner if there is a significant change.';
+  const followup = renderTemplate(template.followup || defaultFollowup, a);
+  if (a.alertType === 'monthly-test') return `${buildEmailSubject(a, templates)}
+
+TEST ONLY — NO LIVE SERVICE INCIDENT.
+
+${intro}
+
+${a.issueKey ? `Reference: ${a.issueKey}
+` : ''}Customer: ${a.clientCode}
+Test month: ${a.testMonth || monthLabel()}
+Status: ${p.status}
+
+Test details:
+${a.message}
+
+${followup}`;
+  return `${buildEmailSubject(a, templates)}
+
+${intro}
+
+Reference: ${a.issueKey}
+Customer: ${a.clientCode}
+Priority: ${a.priorityLabel || a.priority}
+Issue Start Time: ${a.startTime || 'Not specified'}
+Next Update Due: ${a.alertType === 'resolved' ? 'No further update planned' : (a.nextUpdate || 'To be confirmed')}
+Status: ${p.status}
+
+Current situation:
+${a.message}
+
+${followup}
+
+Please reference ${a.issueKey} in any correspondence regarding this incident.`;
+}
+
+function buildEmailHtml(a, templates = DEFAULT_TEMPLATES, brandingInput = DEFAULT_BRANDING) {
+  const p = emailPresentation(a);
+  const branding = normalizeBranding(brandingInput || DEFAULT_BRANDING);
+  const isTest = a.alertType === 'monthly-test';
+  const isResolved = a.alertType === 'resolved';
+  const next = isResolved ? 'No further update planned' : (a.nextUpdate || 'To be confirmed');
+  const fromName = branding.serviceName || a.fromName || 'Service Desk';
+  const details = isTest
+    ? [ ...(a.issueKey ? [['Reference', a.issueKey]] : []), ['Customer', a.clientCode], ['Test month', a.testMonth || monthLabel()], ['Current status', p.status] ]
+    : [ ['Reference', a.issueKey], ['Customer', a.clientCode], ['Priority', a.priorityLabel || a.priority], ['Issue Start Time', a.startTime || 'Not specified'], ['Next Update Due', next], ['Current status', p.status] ];
+  const rows = details.map(([k,v],i) => {
+    const borderStyle = i < details.length - 1 ? 'border-bottom:1px solid #EBECF0;' : '';
+    const valueHtml = k === 'Priority'
+      ? `<span style="display:inline-block;background:${p.accent};color:#FFFFFF;border-radius:999px;padding:4px 9px;font-size:12px;font-weight:700">${esc(v)}</span>`
+      : esc(v);
+    return `<tr><td style="width:34%;padding:11px 14px;color:#626f86;font-size:13px;${borderStyle}">${esc(k)}</td><td style="padding:11px 14px;color:#172B4D;font-size:13px;font-weight:700;${borderStyle}">${valueHtml}</td></tr>`;
+  }).join('');
+  const alertBox = isTest ? `<tr><td style="padding:0 32px 22px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${p.soft};border:1px solid ${p.border};border-radius:8px"><tr><td style="padding:15px 17px;color:#533F04;font-size:14px;line-height:1.5"><strong>TEST ONLY — NO LIVE SERVICE INCIDENT</strong><br>This message is part of the scheduled monthly System Alert test.</td></tr></table></td></tr>` : '';
+  const template = templates?.[templateType(a.alertType)] || {};
+  const intro = renderTemplate(template.intro || p.intro, a);
+  const defaultFollowup = isTest ? 'No action is required unless acknowledgement is part of the agreed test process.' : isResolved ? 'No further incident updates are planned at this time. The Service Desk will continue to monitor the service.' : 'Our support team is actively managing this incident. A further update will be provided by the time shown above, or sooner if there is a significant change.';
+  const followup = renderTemplate(template.followup || defaultFollowup, a);
+
+  const logoSrc = branding.logoDataUri ? 'cid:system-alert-logo' : branding.logoUrl;
+  const logo = logoSrc
+    ? `<img src="${esc(logoSrc)}" alt="" style="display:block;max-height:44px;max-width:190px;margin-bottom:13px;border:0">`
+    : '';
+  const support = branding.supportUrl
+    ? `<div style="margin-top:6px"><a href="${esc(branding.supportUrl)}" style="color:${branding.accentColor};text-decoration:none">${esc(branding.supportLabel || branding.supportUrl)}</a></div>`
+    : '';
+  const footerText = renderTemplate(branding.footerText || DEFAULT_BRANDING.footerText, a);
+
+  return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;padding:0;background:${branding.pageBackground};font-family:Arial,Helvetica,sans-serif;color:#172B4D"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${branding.pageBackground}"><tr><td align="center" style="padding:28px 12px"><table role="presentation" width="680" cellpadding="0" cellspacing="0" style="width:100%;max-width:680px;background:#FFFFFF;border:1px solid #DFE1E6;border-radius:12px;overflow:hidden"><tr><td style="background:${branding.headerBackground};padding:25px 32px">${logo}<div style="font-size:12px;line-height:1.2;letter-spacing:1.5px;font-weight:700;color:${branding.headerText};opacity:.75">${esc(fromName.toUpperCase())}</div><div style="margin-top:8px;font-size:25px;line-height:1.25;font-weight:700;color:${branding.headerText}">${esc(p.title)}</div></td></tr><tr><td style="padding:24px 32px 14px"><div style="display:inline-block;background:${p.accent};color:#FFFFFF;border-radius:5px;padding:9px 14px;font-size:13px;line-height:1.2;font-weight:700;letter-spacing:.3px">${esc(p.badge)}</div><div style="margin-top:18px;font-size:15px;line-height:1.6;color:#172B4D">${esc(intro)}</div></td></tr>${alertBox}<tr><td style="padding:4px 32px 20px"><div style="font-size:16px;font-weight:700;margin-bottom:10px">Incident details</div><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #DFE1E6;border-radius:8px;border-collapse:separate;border-spacing:0;overflow:hidden">${rows}</table></td></tr><tr><td style="padding:0 32px 28px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${p.soft};border-left:4px solid ${p.accent};border-radius:6px"><tr><td style="padding:17px 18px"><div style="font-size:16px;font-weight:700;margin-bottom:9px">${isTest?'Test details':'Current situation'}</div><div style="font-size:14px;line-height:1.65;white-space:pre-line">${esc(a.message || '')}</div></td></tr></table><div style="font-size:14px;line-height:1.6;margin-top:20px">${esc(followup)}</div></td></tr><tr><td style="background:${branding.footerBackground};border-top:1px solid #EBECF0;padding:19px 32px;color:#626F86;font-size:12px;line-height:1.55"><strong style="color:#44546F">${esc(fromName)}</strong><br>${esc(isTest ? 'Scheduled System Alert test.' : footerText)}${support}</td></tr></table></td></tr></table></body></html>`;
+}
+
+function buildSmsText(a, templates = DEFAULT_TEMPLATES) {
+  const configured = templates?.[templateType(a.alertType)]?.sms;
+  if (configured) return renderTemplate(configured, a).slice(0, 700);
+  const issueText = (a.message || a.summary || '').trim();
+  const start = a.startTime || 'Not specified';
+  const next = a.nextUpdate || 'To be confirmed';
+
+  if (a.alertType === 'monthly-test') {
+    return `Hi,\n\nThis is the scheduled monthly System Alert test for ${a.clientCode}.\n\nThere is no live service incident.\n\nTest Month: ${a.testMonth || monthLabel()}\n${a.issueKey ? `Reference: ${a.issueKey}\n\n` : ''}No action is required unless acknowledgement is part of the agreed test process.\n\nMany Thanks`.slice(0, 700);
+  }
+
+  if (a.alertType === 'resolved') {
+    return `Hi,\n\nThe ${a.priorityLabel || a.priority} issue has now been resolved.\n\nIssue Start Time: ${start}\n\nIssue: ${issueText}\n\nService Status: Restored\n\nNo further updates are planned at this time.\n\nMany Thanks`.slice(0, 700);
+  }
+
+  if (a.alertType === 'update') {
+    return `Hi,\n\nAn update is available for the ${a.priorityLabel || a.priority} issue.\n\nIssue Start Time: ${start}\n\nIssue: ${issueText}\n\nNext Update Due: ${next}\n\nOur priority escalation process remains active and a further update will follow shortly.\n\nMany Thanks`.slice(0, 700);
+  }
+
+  return `Hi,\n\nA ${a.priorityLabel || a.priority} issue has been identified.\n\nIssue Start Time: ${start}\n\nIssue: ${issueText}\n\nNext Update Due: ${next}\n\nOur priority escalation process has started and a further update will follow shortly.\n\nMany Thanks`.slice(0, 700);
+}
+
+async function sendTwilio(to, body) {
+  if (String(process.env.SYSTEM_ALERT_MOCK_PROVIDERS || '').toLowerCase() === 'true') return { sid: 'MOCK-SMS', status: 'mocked', to, body };
+  const cfg = await getProviderSettings();
+  const accountSid = (await getProviderSecret('twilioAccountSid')) || process.env.TWILIO_ACCOUNT_SID;
+  const username = (await getProviderSecret('twilioApiKey')) || process.env.TWILIO_API_KEY || accountSid;
+  const password = (await getProviderSecret('twilioApiSecret')) || (await getProviderSecret('twilioAuthToken')) || process.env.TWILIO_API_SECRET || process.env.TWILIO_AUTH_TOKEN;
+  if (!accountSid || !username || !password) throw new Error('Twilio credentials are not configured. Add them in System Alert > Communication providers or Forge environment variables.');
+  const regionName = cfg.twilioRegion || process.env.TWILIO_REGION || 'global';
+  const region = regionName === 'ie1' ? 'https://api.dublin.ie1.twilio.com' : 'https://api.twilio.com';
+  const params = new URLSearchParams({ To: to, Body: body });
+  const messagingServiceSid = cfg.twilioMessagingServiceSid || process.env.TWILIO_MESSAGING_SERVICE_SID;
+  const fromNumber = cfg.twilioFromNumber || process.env.TWILIO_FROM_NUMBER;
+  if (messagingServiceSid) params.set('MessagingServiceSid', messagingServiceSid);
+  else if (fromNumber) params.set('From', fromNumber);
+  else throw new Error('Configure a Twilio Messaging Service SID or From number.');
+  const res = await fetch(`${region}/2010-04-01/Accounts/${accountSid}/Messages.json`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: params.toString()
+  });
+  if (!res.ok) throw new Error(`Twilio send failed (${res.status}): ${await res.text()}`);
+  const j = await res.json();
+  return { sid: j.sid, status: j.status };
+}
+
+async function getMicrosoftAccessToken(cfg) {
+  const tenantId = normalizeTextValue(cfg.microsoftTenantId);
+  const mode = cfg.microsoftMode === 'enterprise' ? 'enterprise' : 'marketplace';
+  const clientId = mode === 'marketplace'
+    ? normalizeTextValue(process.env.MICROSOFT_MARKETPLACE_CLIENT_ID)
+    : normalizeTextValue(cfg.microsoftClientId);
+  const clientSecret = mode === 'marketplace'
+    ? normalizeTextValue(process.env.MICROSOFT_MARKETPLACE_CLIENT_SECRET)
+    : await getProviderSecret('microsoftClientSecret');
+  if (!tenantId || !clientId || !clientSecret) {
+    if (mode === 'marketplace') throw new Error('Microsoft 365 Marketplace connection is not ready. Enter the Tenant ID and ensure the System Alert Marketplace Microsoft application is configured.');
+    throw new Error('Microsoft 365 Enterprise setup is incomplete. Add Tenant ID, Client ID and Client Secret in Communication Providers.');
+  }
+  const body = new URLSearchParams({ client_id: clientId, client_secret: clientSecret, scope: 'https://graph.microsoft.com/.default', grant_type: 'client_credentials' });
+  const res = await fetch(`https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`, { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body.toString() });
+  if (!res.ok) throw new Error(`Microsoft 365 authentication failed (${res.status}): ${await res.text()}`);
+  const data = await res.json();
+  if (!data.access_token) throw new Error('Microsoft 365 did not return an access token.');
+  return data.access_token;
+}
+
+async function sendMicrosoft365(toEmails, subject, html, text, fromName, replyToEmail='', branding=null) {
+  if (String(process.env.SYSTEM_ALERT_MOCK_PROVIDERS || '').toLowerCase() === 'true') return { mocked: true, provider: 'microsoft365', recipients: toEmails, subject };
+  const cfg = await getProviderSettings();
+  const sender = normalizeTextValue(cfg.microsoftSenderMailbox);
+  if (!sender) throw new Error('Microsoft 365 sender mailbox is not configured.');
+  const recipients = [...new Set((toEmails || []).map(normalizeTextValue).filter(Boolean))];
+  if (!recipients.length) return true;
+  const token = await getMicrosoftAccessToken(cfg);
+  const replyTo = normalizeTextValue(cfg.microsoftReplyToEmail || replyToEmail || sender);
+  const message = {
+    subject,
+    body: { contentType: 'HTML', content: html },
+    toRecipients: recipients.map(address => ({ emailAddress: { address } })),
+    replyTo: replyTo ? [{ emailAddress: { address: replyTo, name: normalizeTextValue(cfg.microsoftFromName || fromName || 'Service Desk') } }] : []
+  };
+  const logo = logoAttachmentFromBranding(branding || {});
+  if (logo) message.attachments = [{ '@odata.type':'#microsoft.graph.fileAttachment', name:logo.filename, contentType:logo.type, contentBytes:logo.content, isInline:true, contentId:logo.content_id }];
+  const res = await fetch(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(sender)}/sendMail`, { method:'POST', headers:{'Authorization':`Bearer ${token}`,'Content-Type':'application/json'}, body:JSON.stringify({message, saveToSentItems:true}) });
+  if (!res.ok) throw new Error(`Microsoft 365 email send failed (${res.status}): ${await res.text()}`);
+  return true;
+}
+
+async function sendEmail(toEmails, subject, html, text, fromName, replyToEmail='', branding=null) {
+  if (String(process.env.SYSTEM_ALERT_MOCK_PROVIDERS || '').toLowerCase() === 'true') return { mocked: true, provider: 'email', recipients: toEmails, subject };
+  const cfg = await getProviderSettings();
+  if (cfg.emailProvider === 'microsoft365') return await sendMicrosoft365(toEmails, subject, html, text, fromName, replyToEmail, branding);
+  const apiKey = (await getProviderSecret('sendgridApiKey')) || process.env.SENDGRID_API_KEY;
+  const fromEmail = cfg.sendgridFromEmail || process.env.ALERT_FROM_EMAIL;
+  if (!apiKey || !fromEmail) throw new Error('Email provider is not configured. Add the SendGrid API key and sender address in System Alert > Communication providers or Forge environment variables.');
+  const recipients = [...new Set((toEmails || []).map(normalizeTextValue).filter(Boolean))];
+  if (!recipients.length) return true;
+  const replyTo = normalizeTextValue(cfg.sendgridReplyToEmail || replyToEmail || process.env.ALERT_REPLY_TO || fromEmail);
+  const providerFromName = normalizeTextValue(cfg.sendgridFromName || process.env.ALERT_FROM_NAME || fromName || 'Service Desk');
+  const body = {
+    // One personalization per recipient prevents customers from seeing one another's addresses.
+    personalizations: recipients.map(email => ({ to: [{ email }] })),
+    from: { email: fromEmail, name: providerFromName },
+    reply_to: { email: replyTo, name: process.env.ALERT_REPLY_TO_NAME || providerFromName },
+    subject,
+    content: [{ type: 'text/plain', value: text }, { type: 'text/html', value: html }]
+  };
+  const logoAttachment = logoAttachmentFromBranding(branding || {});
+  if (logoAttachment) body.attachments = [logoAttachment];
+  const res = await fetch('https://api.sendgrid.com/v3/mail/send', {
+    method:'POST',
+    headers:{'Authorization':`Bearer ${apiKey}`,'Content-Type':'application/json'},
+    body:JSON.stringify(body)
+  });
+  if (!res.ok) throw new Error(`Email send failed (${res.status}): ${await res.text()}`);
+  return true;
+}
+
+// Email and SMS are delivered independently: an outage on one provider must not
+// stop the other channel reaching the client. `delivered` is false only when
+// nothing reached anyone, so callers can fail loudly (and the scheduler can retry
+// safely) without resending to people who already received the message.
+async function deliverChannels(emailRecipients, smsRecipients, subject, html, text, smsText, settings, branding) {
+  const email = { attempted: emailRecipients.length, ok: false };
+  const sms = { attempted: smsRecipients.length, sent: 0, failed: [] };
+  const failures = [];
+  if (emailRecipients.length) {
+    try {
+      await sendEmail(emailRecipients, subject, html, text, settings.fromName, settings.replyToEmail, branding);
+      email.ok = true;
+    } catch (e) {
+      email.error = String(e?.message || e).slice(0, 500);
+      failures.push(`Email failed: ${email.error.slice(0, 200)}`);
+    }
+  }
+  for (const mobile of smsRecipients) {
+    try { await sendTwilio(mobile, smsText); sms.sent++; }
+    catch (e) { sms.failed.push({ mobile: maskPhone(mobile), error: e.message }); }
+  }
+  if (sms.failed.length) failures.push(`${sms.failed.length} of ${smsRecipients.length} SMS failed: ${String(sms.failed[0].error || '').slice(0, 200)}`);
+  return { email, sms, failures, delivered: email.ok || sms.sent > 0 };
+}
+
+resolver.define('previewEmail', async ({ payload }) => {
+  const settings = await getSettings();
+  const fields = ['priority','project'];
+  if (settings.clientFieldId) fields.push(settings.clientFieldId);
+  if (settings.issueStartFieldId) fields.push(settings.issueStartFieldId);
+  if (settings.nextUpdateFieldId) fields.push(settings.nextUpdateFieldId);
+  for (const m of settings.optionalFieldMappings || []) if (m.fieldId && !fields.includes(m.fieldId)) fields.push(m.fieldId);
+  const check = await api.asUser().requestJira(route`/rest/api/3/issue/${payload.issueKey}?fields=${fields.join(',')}`);
+  if (!check.ok) throw new Error(`Could not validate Jira issue (${check.status}).`);
+  const currentIssue = await check.json();
+  const currentProject = currentIssue.fields.project?.key || '';
+  const currentPriority = fieldText(currentIssue.fields.priority);
+  if (settings.allowedProjectKey && currentProject !== settings.allowedProjectKey) throw new Error('System Alert is not enabled for this project.');
+  if (!isEnabledPriority(settings, currentPriority)) throw new Error(`System Alert is not enabled for priority ${currentPriority || 'Not set'}.`);
+  const currentPriorityConfig = getPriorityConfig(settings, currentPriority);
+  const currentClientCode = settings.clientFieldId ? extractClientCode(currentIssue.fields[settings.clientFieldId]) : '';
+  if (!currentClientCode) throw new Error('The Jira ticket does not have a valid client configured.');
+  if (extractClientCode(payload.clientCode) !== currentClientCode) throw new Error('Client safety check failed: the alert client no longer matches the Jira ticket. Refresh the ticket before continuing.');
+
+  // Prefer values currently entered in the alert form. If either field is empty,
+  // fall back to the configured Jira custom field so the preview always matches the ticket.
+  const startTime = payload.startTime || (settings.issueStartFieldId ? formatDateTime(fieldText(currentIssue.fields[settings.issueStartFieldId])) : '');
+  const nextUpdate = payload.nextUpdate || (settings.nextUpdateFieldId ? formatDateTime(fieldText(currentIssue.fields[settings.nextUpdateFieldId])) : '');
+  const a = { ...payload, clientCode: currentClientCode, startTime, nextUpdate, priority: currentPriority, priorityLabel: currentPriorityConfig.label, priorityConfig: currentPriorityConfig, fromName: settings.fromName, testMonth: payload.testMonth || monthLabel(), templateFields: mappedTemplateFields(currentIssue.fields, settings) };
+  const templates = await getTemplates();
+  const branding = await getBranding();
+  const presentation = emailPresentation(a);
+  return {
+    subject: buildEmailSubject(a, templates),
+    html: buildEmailHtml(a, templates, branding),
+    text: buildEmailText(a, templates),
+    model: buildPreviewModel(a, templates, branding)
+  };
+});
+
+resolver.define('sendAlert', async ({ payload, context }) => {
+  const settings = await getSettings();
+  const validationFields = ['priority','project'];
+  for (const m of settings.optionalFieldMappings || []) if (m.fieldId && !validationFields.includes(m.fieldId)) validationFields.push(m.fieldId);
+  if (settings.clientFieldId) validationFields.push(settings.clientFieldId);
+  const check = await api.asUser().requestJira(route`/rest/api/3/issue/${payload.issueKey}?fields=${validationFields.join(',')}`);
+  if (!check.ok) throw new Error(`Could not validate Jira issue (${check.status}).`);
+  const currentIssue = await check.json();
+  const currentProject = currentIssue.fields.project?.key || '';
+  const currentPriority = fieldText(currentIssue.fields.priority);
+  if (settings.allowedProjectKey && currentProject !== settings.allowedProjectKey) throw new Error('System Alert is not enabled for this project.');
+  if (!isEnabledPriority(settings, currentPriority)) throw new Error(`System Alert is not enabled for priority ${currentPriority || 'Not set'}.`);
+  const currentPriorityConfig = getPriorityConfig(settings, currentPriority);
+  const currentClient = settings.clientFieldId ? clientIdentity(currentIssue.fields[settings.clientFieldId]) : { optionId:'', code:'' };
+  const currentClientCode = currentClient.code;
+  if (!currentClientCode) throw new Error('The Jira ticket does not have a valid client configured. Alert blocked.');
+  if (extractClientCode(payload.clientCode) !== currentClientCode) throw new Error('Client safety check failed: the alert client does not match the Jira ticket. Refresh before sending.');
+  payload.priority = currentPriority;
+  payload.clientCode = currentClientCode;
+  const selected = await Promise.all((payload.contactIds || []).map(getContact));
+  const contacts = selected.filter(Boolean).map(c => ({
+    ...c,
+    clientCode: normalizeTextValue(c.clientCode).toUpperCase(),
+    name: normalizeTextValue(c.name),
+    email: normalizeTextValue(c.email),
+    mobile: normalizeTextValue(c.mobile),
+    priorities: normalizePriorities(c.priorities),
+    emailAlerts: c.emailAlerts === true,
+    smsAlerts: c.smsAlerts === true,
+    monthlyTestAlerts: c.monthlyTestAlerts === true,
+    active: c.active !== false
+  }));
+  if (!contacts.length) throw new Error('Select at least one recipient.');
+  const sameClient = c => (currentClient.optionId && c.clientOptionId) ? String(c.clientOptionId) === String(currentClient.optionId) : c.clientCode === currentClientCode;
+  const wrongClient = contacts.filter(c => !sameClient(c));
+  if (wrongClient.length) throw new Error(`Recipient safety check failed: ${wrongClient.length} selected contact(s) belong to a different Jira client. Nothing was sent.`);
+  const activeClientContacts = contacts.filter(c => c.active && sameClient(c));
+  if (activeClientContacts.length !== contacts.length) throw new Error('Recipient safety check failed: one or more selected contacts are inactive or do not belong to this client. Nothing was sent.');
+
+  const isTest = payload.alertType === 'monthly-test';
+  const eligibleContacts = activeClientContacts.filter(c => isTest ? c.monthlyTestAlerts === true : normalizePriorities(c.priorities).some(p => priorityKey(p) === priorityKey(payload.priority)));
+  if (!eligibleContacts.length) throw new Error(isTest ? 'None of the selected contacts are enabled for Monthly Test alerts.' : `None of the selected contacts are enabled for ${payload.priority} alerts.`);
+
+  const a = { ...payload, priorityLabel: currentPriorityConfig.label, priorityConfig: currentPriorityConfig, fromName: settings.fromName, testMonth: payload.testMonth || monthLabel(), templateFields: mappedTemplateFields(currentIssue.fields, settings) };
+  const templates = await getTemplates();
+  const branding = await getBranding();
+  const subject = buildEmailSubject(a, templates);
+  const text = buildEmailText(a, templates);
+  const html = buildEmailHtml(a, templates, branding);
+
+  const emailRecipients = payload.sendEmail
+    ? [...new Set(eligibleContacts.filter(c => c.email && c.emailAlerts).map(c => c.email))]
+    : [];
+  const smsRecipients = payload.sendSms
+    ? [...new Set(eligibleContacts.filter(c => c.mobile && c.smsAlerts).map(c => c.mobile))]
+    : [];
+  if (!emailRecipients.length && !smsRecipients.length) throw new Error('The selected recipients do not have an enabled email or SMS destination for this alert.');
+
+  const delivery = await deliverChannels(emailRecipients, smsRecipients, subject, html, text, buildSmsText(a, templates), settings, branding);
+  if (!delivery.delivered) throw new Error(`Nothing was sent. ${delivery.failures.join(' ')}`);
+  const results = { email: delivery.email, sms: delivery.sms };
+  const emailSent = results.email.ok ? emailRecipients.length : 0;
+
+  const now = new Date().toISOString();
+  const entry = {
+    at: now,
+    alertType: a.alertType,
+    priority: a.priority,
+    emailCount: emailSent,
+    emailFailed: Boolean(results.email.error),
+    smsCount: results.sms.sent,
+    smsFailedCount: results.sms.failed.length,
+    monthKey: isTest ? monthKey() : undefined,
+    monthLabel: isTest ? a.testMonth : undefined
+  };
+
+  const issueHistoryKey = `system-alert:history:${a.issueKey}`;
+  const history = await readHistory(issueHistoryKey);
+  await kvs.set(issueHistoryKey, [entry, ...history].slice(0, 50));
+
+  if (isTest) {
+    const testHistoryKey = `system-alert:test-history:${a.clientCode}`;
+    const testHistory = await readHistory(testHistoryKey);
+    await kvs.set(testHistoryKey, [entry, ...testHistory].slice(0, 36));
+  }
+
+  const failureNote = delivery.failures.length ? ` | FAILED: ${delivery.failures.join(' ')}` : '';
+  const commentText = isTest
+    ? `Monthly System Alert TEST sent — TEST ONLY | ${a.testMonth} | Email: ${emailSent} recipient(s) | SMS: ${results.sms.sent} recipient(s)${failureNote}`
+    : `System Alert sent — ${a.alertType.toUpperCase()} | Email: ${emailSent} recipient(s) | SMS: ${results.sms.sent} recipient(s)${a.nextUpdate ? ` | Next update: ${a.nextUpdate}` : ''}${failureNote}`;
+  results.comment = { ok: false };
+  try {
+    const commentRes = await api.asApp().requestJira(route`/rest/servicedeskapi/request/${a.issueKey}/comment`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json','Accept':'application/json'},
+      body:JSON.stringify({ body: commentText, public: false })
+    });
+    if (!commentRes.ok) {
+      results.comment.error = `Internal Jira comment failed (${commentRes.status}): ${await commentRes.text()}`;
+    } else {
+      results.comment.ok = true;
+    }
+  } catch (e) {
+    results.comment.error = e.message;
+  }
+
+  return { ...results, isTest, testMonth: a.testMonth };
+});
+
+
+async function monthlyTestContacts(clientCode) {
+  const code = normalizeTextValue(clientCode).toUpperCase();
+  const all = (await getAllContacts()).map(c => ({
+    ...c,
+    clientCode: normalizeTextValue(c.clientCode).toUpperCase(),
+    clientName: normalizeTextValue(c.clientName),
+    name: normalizeTextValue(c.name),
+    email: normalizeTextValue(c.email),
+    mobile: normalizeTextValue(c.mobile),
+    emailAlerts: c.emailAlerts === true,
+    smsAlerts: c.smsAlerts === true,
+    monthlyTestAlerts: c.monthlyTestAlerts === true,
+    active: c.active !== false
+  }));
+  return all.filter(c => c.active && c.monthlyTestAlerts && c.clientCode === code);
+}
+
+async function deliverMonthlyTest(clientCode, { automatic = false, now = new Date() } = {}) {
+  const settings = await getSettings();
+  const code = normalizeTextValue(clientCode).toUpperCase();
+  if (!code) throw new Error('Choose a client for the monthly test.');
+  const clientContacts = await monthlyTestContacts(code);
+  if (!clientContacts.length) throw new Error('No contacts are enabled for Monthly Test alerts for this client.');
+
+  const emailRecipients = [...new Set(clientContacts.filter(c => c.emailAlerts && c.email).map(c => c.email))];
+  const smsRecipients = [...new Set(clientContacts.filter(c => c.smsAlerts && c.mobile).map(c => c.mobile))];
+  if (!emailRecipients.length && !smsRecipients.length) throw new Error('No enabled email or SMS destinations are configured for this client.');
+
+  const label = monthLabel(now);
+  const a = {
+    issueKey: '', clientCode: code, priority: '', alertType: 'monthly-test',
+    summary: 'Monthly System Alert Test', message: automatic
+      ? `This is the scheduled monthly System Alert test for ${code}.`
+      : `This is a manual monthly System Alert diagnostic test for ${code}.`,
+    startTime: '', nextUpdate: '', testMonth: label, fromName: settings.fromName
+  };
+  const templates = await getTemplates();
+  const branding = await getBranding();
+  const subject = buildEmailSubject(a, templates);
+  const text = buildEmailText(a, templates);
+  const html = buildEmailHtml(a, templates, branding);
+
+  const delivery = await deliverChannels(emailRecipients, smsRecipients, subject, html, text, buildSmsText(a, templates), settings, branding);
+  if (!delivery.delivered) throw new Error(`Nothing was sent. ${delivery.failures.join(' ')}`);
+  const emailOk = delivery.email.ok;
+  const emailCount = emailOk ? emailRecipients.length : 0;
+  const smsSent = delivery.sms.sent;
+  const smsFailedCount = delivery.sms.failed.length;
+
+  const entry = {
+    at: new Date().toISOString(), automatic, manual: !automatic, alertType: 'monthly-test',
+    clientCode: code, emailCount, emailOk, emailFailed: Boolean(delivery.email.error),
+    smsCount: smsSent, smsFailedCount,
+    monthKey: monthKey(now), monthLabel: label
+  };
+  const historyKey = `system-alert:test-history:${code}`;
+  const history = await readHistory(historyKey);
+  await kvs.set(historyKey, [entry, ...history].slice(0, 36));
+  return { clientCode: code, sent: true, automatic, emailCount, emailFailed: entry.emailFailed, emailError: delivery.email.error || '', smsCount: smsSent, smsFailedCount, at: entry.at, monthKey: entry.monthKey, monthLabel: label };
+}
+
+resolver.define('runMonthlyTestNow', async ({ payload }) => {
+  return await deliverMonthlyTest(payload?.clientCode, { automatic: false, now: new Date() });
+});
+
+export async function monthlyTestScheduler() {
+  try {
+    await scrubLegacyHistoryAccountIds();
+  } catch (e) {
+    console.warn(`Legacy history scrub skipped: ${e.message}`);
+  }
+  const settings = await getSettings();
+  const now = new Date();
+  const targetHour = Number(settings.monthlyTestHour ?? 10);
+  const schedule = scheduleState(now, targetHour);
+  const statusBase = {
+    checkedAt: now.toISOString(),
+    timeZone: schedule.timeZone,
+    targetHour: schedule.targetHour,
+    local: schedule.local
+  };
+
+  if (settings.monthlyTestEnabled === false) {
+    const status = { ...statusBase, outcome: 'skipped', reason: 'Automatic monthly test is disabled.' };
+    await kvs.set(SCHEDULER_STATUS_KEY, status);
+    return { skipped: status.reason };
+  }
+  if (!schedule.due) {
+    const status = { ...statusBase, outcome: 'skipped', reason: schedule.reason };
+    await kvs.set(SCHEDULER_STATUS_KEY, status);
+    return { skipped: status.reason };
+  }
+
+  const all = (await getAllContacts()).map(c => ({
+    ...c,
+    clientCode: normalizeTextValue(c.clientCode).toUpperCase(),
+    monthlyTestAlerts: c.monthlyTestAlerts === true,
+    active: c.active !== false
+  }));
+  const clients = [...new Set(all.filter(c => c.active && c.monthlyTestAlerts && c.clientCode).map(c => c.clientCode))].sort();
+  const month = monthKey(now);
+  const label = monthLabel(now);
+  const results = [];
+
+  for (const clientCode of clients) {
+    const markerKey = `${AUTO_TEST_PREFIX}${clientCode}:${month}`;
+    const marker = await kvs.get(markerKey);
+    const runningAgeMs = marker?.status === 'running' && marker?.at ? (now.getTime() - new Date(marker.at).getTime()) : 0;
+    if (marker?.status === 'sent' || (marker?.status === 'running' && runningAgeMs < 2 * 60 * 60 * 1000)) {
+      results.push({ clientCode, skipped: 'Already processed this month.' });
+      continue;
+    }
+
+    await kvs.set(markerKey, { status: 'running', at: now.toISOString() });
+    try {
+      const sent = await deliverMonthlyTest(clientCode, { automatic: true, now });
+      // Partial channel failures are still marked sent so a later check never
+      // re-delivers to contacts who already received this month's test.
+      await kvs.set(markerKey, { status: 'sent', at: sent.at, emailCount: sent.emailCount, emailFailed: sent.emailFailed, smsCount: sent.smsCount, smsFailedCount: sent.smsFailedCount });
+      results.push(sent);
+    } catch (e) {
+      await kvs.set(markerKey, { status: 'failed', at: new Date().toISOString(), error: e.message });
+      results.push({ clientCode, error: e.message });
+    }
+  }
+
+  const failed = results.filter(r => r.error).length;
+  const sent = results.filter(r => r.sent).length;
+  const channelFailures = results.filter(r => r.sent && (r.emailFailed || r.smsFailedCount)).length;
+  const outcome = failed || channelFailures ? (sent ? 'partial-failure' : 'failed') : (sent ? 'sent' : 'skipped');
+  const reason = failed || channelFailures
+    ? `${failed} client(s) failed; ${sent} client(s) sent${channelFailures ? `, ${channelFailures} with an email or SMS failure` : ''}.`
+    : sent
+      ? `Monthly test sent for ${sent} client(s).`
+      : 'No eligible client required a send on this check.';
+  await kvs.set(SCHEDULER_STATUS_KEY, { ...statusBase, outcome, reason, results: results.slice(0, 50) });
+  return { monthKey: month, monthLabel: label, results };
+}
+
+export const handler = resolver.getDefinitions();
