@@ -12,6 +12,7 @@
     "prepare": "node scripts/sync-version.mjs",
     "test": "node --test --experimental-test-module-mocks test/*.test.mjs",
     "test:quick": "node --test test/safety.test.mjs",
-    "sync:version": "node scripts/sync-version.mjs"
+    "sync:version": "node scripts/sync-version.mjs",
+    "build": "for ui in admin alert panel; do npm --prefix static/$ui ci && npm --prefix static/$ui run build || exit 1; done"
   }
 }

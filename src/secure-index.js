@@ -28,9 +28,8 @@ const ADMIN_RESOLVERS = new Set([
   'importBackupBatch'
 ]);
 
-// Operations that actually deliver a message must not run on an inactive
-// Marketplace production licence. Development/staging remain usable so the
-// app can be tested before the Marketplace listing is approved.
+// Operations that actually deliver a message. The Marketplace edition gates these on an
+// active licence; this internal edition has none, so licenceState never enforces it.
 const LICENSED_DELIVERY_RESOLVERS = new Set([
   'sendAlert',
   'testEmailProvider',
@@ -88,13 +87,12 @@ const assertSafeId = (value, label = 'Identifier') => {
   if (!SAFE_ID_RE.test(text(value))) throw new Error(`Invalid ${label.toLowerCase()}.`);
 };
 
+// Retail inMotion internal edition: no Marketplace licence, so delivery is never licence-gated.
 function licenceState(context = {}) {
   const environmentType = text(context.environmentType).toUpperCase();
-  const production = environmentType === 'PRODUCTION';
-  const active = context?.license?.active === true || context?.license?.isActive === true;
   return {
-    enforced: production,
-    active: production ? active : true,
+    enforced: false,
+    active: true,
     environmentType: environmentType || 'UNKNOWN'
   };
 }

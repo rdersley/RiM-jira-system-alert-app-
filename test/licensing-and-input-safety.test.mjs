@@ -9,26 +9,19 @@ test('internal edition does not enable Marketplace licensing', () => {
   assert.doesNotMatch(manifest, /licensing:\s*\n\s+enabled:\s*true/);
 });
 
-test('scheduled monthly test uses hardened licence-aware scheduler directly', () => {
+test('scheduled monthly test runs through the hardened scheduler', () => {
   const manifest = text('manifest.yml');
   const guard = text('src/secure-index.js');
   assert.match(manifest, /monthly-test-scheduler[\s\S]*handler:\s+secure-index\.monthlyTestScheduler/);
   assert.match(guard, /export async function monthlyTestScheduler\(\.\.\.args\)/);
   assert.match(guard, /return app\.monthlyTestScheduler\(\.\.\.args\)/);
-  assert.match(guard, /Marketplace licence is inactive/);
 });
 
-test('message delivery is blocked for inactive production licences', () => {
+test('internal edition never blocks delivery on a Marketplace licence', () => {
   const guard = text('src/secure-index.js');
-  assert.match(guard, /LICENSED_DELIVERY_RESOLVERS/);
-  assert.match(guard, /'sendAlert'/);
-  assert.match(guard, /requires an active Marketplace licence to send communications/);
-  assert.match(guard, /environmentType === 'PRODUCTION'/);
-});
-
-test('development and staging remain testable without Marketplace licence context', () => {
-  const guard = text('src/secure-index.js');
-  assert.match(guard, /active:\s*production \? active : true/);
+  assert.match(guard, /enforced:\s*false/);
+  assert.match(guard, /active:\s*true/);
+  assert.doesNotMatch(guard, /environmentType === 'PRODUCTION'/);
 });
 
 test('resolver boundary validates issue keys, recipient ids, email and phone values', () => {
